@@ -631,6 +631,14 @@ def cmd_pick_download(params):
         "partial": bool(failed) and bool(downloaded),
         "note": _build_note(failed, deferred, max_pages),
     }
+
+    # 首次使用的提示：批量入口也要给，而且**整批只给一次**。
+    # 这里检查的是和 jm.cmd_download 同一个磁盘标记，所以：
+    #   · 用户先单本下过 → 这里不再提示
+    #   · 用户第一次就批量下 6 本 → 只在这一处提示一次，不会 6 条
+    if downloaded and jm._should_hint():
+        jm._mark_hinted()
+        payload["note"] = (payload["note"] + " " if payload["note"] else "") + jm._HINT_TEXT
     if all_failed:
         payload["error"] = "; ".join(
             f"JM{f['id']}: {f['error']}" for f in failed

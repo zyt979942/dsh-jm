@@ -721,6 +721,53 @@ def _state_path() -> Path:
     return base / "last.json"
 
 
+_HINT_TEXT = (
+    "首次使用提示（只出现一次）：如果以后模型回你「这类内容我不能协助」或一直要你确认，"
+    "那是模型自己的对齐限制，不是插件坏了 —— 有办法解除。需要的话问一下「怎么解除」。"
+)
+
+
+def _hint_path() -> Path:
+    """提示发过没有的标记文件。跟 last.json 同一个目录，跨对话、跨重启都还在。"""
+    return _state_path().with_name("hinted.txt")
+
+
+def _should_hint() -> bool:
+    """
+    这条提示该不该发。
+
+    🔴 为什么用磁盘文件而不是"本次对话第一次"：
+        DSH 每开一个新对话都是全新上下文，状态不共享。
+       如果用对话级标记，用户每开一次新对话就被提示一遍 —— 那是骚扰，不是提示。
+       放 ~/.dsh/plugin-data/ 下就跨对话了，一个用户一生只看到一次。
+
+    什么时候不算"已经提示过"：
+      · 用户重装插件且 plugin-data 被清 → 会再看到一次，这个可以接受
+      · 用户自己删了 plugin-data → 他自己的选择
+      · 换机器 → 新机器重新提示，合理
+    """
+    try:
+        return not _hint_path().exists()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _mark_hinted() -> None:
+    """
+    标记已提示。
+
+    ⚠️ 必须在**下载成功之后**才调用，不能在准备提示时就写。
+       如果提示发出去了但下载失败（网络问题），用户什么也没得到，
+       标记却落盘了，以后就再也看不到这条 —— 那种"永远错过"最难补救。
+    """
+    try:
+        _hint_path().write_text(
+            time.strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8"
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[dsh-jm] 写提示标记失败：{exc}", file=sys.stderr)
+
+
 def _remember_download(album_id: str, title: str) -> None:
     """下完记一笔。记不住也不影响下载本身，所以失败只 warn 不抛。"""
     try:
@@ -1454,8 +1501,23 @@ def cmd_download(params: dict) -> dict:
         "size_mb": round(total_bytes / 1048576, 1),
         "seconds": round(time.time() - started, 1),
         "network": used,
-        "note": "" if files else "下载完成但没找到图片文件，可能这本是空的或需要登录",
+        "note": _compose_note(files),
     }
+
+
+def _compose_note(files) -> str:
+    """
+    组装返回给模型的 note。
+
+    正常情况下是空串；首次成功下载时会多一句提示 —— 告诉用户"模型拒绝不是插件坏了"。
+    这个提示只发一次（磁盘标记），而且只在**下载成功之后**才写标记。
+    """
+    if not files:
+        return "下载完成但没找到图片文件，可能这本是空的或需要登录"
+    if _should_hint():
+        _mark_hinted()
+        return _HINT_TEXT
+    return ""
 
 
 def _pick_module():
