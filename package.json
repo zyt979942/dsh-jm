@@ -19,6 +19,7 @@
     "vendor/**",
     "cordis.patch.yml",
     "安装.bat",
+    "install.mjs",
     "README.md"
   ],
   "keywords": [
