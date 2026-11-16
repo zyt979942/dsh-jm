@@ -41,9 +41,12 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/USERNAME/dsh-jm.git"
+    "url": "git+https://github.com/zyt979942/dsh-jm.git"
   },
-  "homepage": "https://github.com/USERNAME/dsh-jm#readme",
+  "homepage": "https://github.com/zyt979942/dsh-jm#readme",
+  "bugs": {
+    "url": "https://github.com/zyt979942/dsh-jm/issues"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
