@@ -532,10 +532,16 @@ def cmd_recommend(params: dict) -> dict:
         name = str(b.get("author") or "").strip()
         if name:
             author_counts[name] = author_counts.get(name, 0) + 1
-    # 只取收过 2 本以上的 —— 只收过 1 本的作者说明不了偏好，反而会稀释
-    top_authors = [
-        (a, n) for a, n in sorted(author_counts.items(), key=lambda kv: -kv[1]) if n >= 2
-    ][:5]
+    # ⚠️ 不做 "必须收过 2 本" 的过滤。
+    #
+    #   我一开始加了这条，理由听起来很合理：收过 1 本说明不了偏好。
+    #   但实测下来库里 16 本有 13 个作者，其中 12 个都只收过 1 本 ——
+    #   过滤之后只剩 1 个作者能用，作者通道等于形同虚设。
+    #
+    #   用户的原话是"哪怕只有一个作者也算"。而且从行为上看：
+    #   收过 1 本也是"我主动挑了这个人的作品"，比随机候选强。
+    #   所以全取，只按收的本数降序，次数多的优先占位。
+    top_authors = sorted(author_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:8]
 
     for author, _n in top_authors:
         try:
@@ -688,28 +694,51 @@ def cmd_recommend(params: dict) -> dict:
     picked = {c["id"] for c in top}
 
     # ── 作者位 ──
-    # 从"作者通道来的"候选里挑，按作者出现次数降序（越常收的作者越优先），
-    # 同作者内按分数排。已下过的已经在上游排除了，这里不用再判。
+    # ⚠️ 按作者**轮转**，不是按分数一路排下去。
+    #
+    #   我第一版是按 (作者出现次数, 分数) 排序后直接取前 N 个 ——
+    #   结果名额全被收得最多的那个作者吃掉了（びよびよ 占 2/2），
+    #   其他 12 个作者一个都露不出来。用户要的是"哪怕只有一个作者也算"，
+    #   意思是**每个作者都该有机会**，不是只照顾最高的那个。
+    #
+    #   所以先按作者分组，每轮从每个作者里取一个（组内按分数降序），
+    #   轮完一遍还不够再开第二轮。
     author_pool = [
         c for c in scored
         if c.get("fromAuthor") and c["id"] not in picked
     ]
-    author_pool.sort(
-        key=lambda c: (-author_counts.get(c.get("fromAuthor") or "", 0), -c["score"])
-    )
-
+    by_author = {}
     for c in author_pool:
-        if len(top) >= main_quota + author_n:
+        by_author.setdefault(c.get("fromAuthor") or "", []).append(c)
+    for a in by_author:
+        by_author[a].sort(key=lambda c: -c["score"])
+    ordered_authors = sorted(
+        by_author.keys(), key=lambda a: (-author_counts.get(a, 0), a)
+    )
+    while len(top) < main_quota + author_n and any(by_author.values()):
+        progressed = False
+        for a in ordered_authors:
+            if len(top) >= main_quota + author_n:
+                break
+            if not by_author[a]:
+                continue
+            c = by_author[a].pop(0)
+            if c["id"] in picked:
+                continue
+            top.append(c)
+            picked.add(c["id"])
+            c["slot"] = "author"
+            progressed = True
+        if not progressed:
             break
-        top.append(c)
-        picked.add(c["id"])
-        c["slot"] = "author"
-
     # ── 探索位 ──
-    rest = [c for c in scored if c["id"] not in picked]
     # 先保证"戳中小众"的进来，同组内按分数降序。
     # ⚠️ 不能按"小众命中个数"排：命中 8 个冷 tags 的杂食本会挤掉
     #    命中 2 个但分数高得多的，列表分数忽高忽低就没法看了。
+    #
+    # 注意 rest 是「剩下所有没进 top 的」，不是「scored 里切一刀」——
+    # 作者位是从中间挑的，所以不能用切片。这条我漏过，直接 NameError。
+    rest = [c for c in scored if c["id"] not in picked]
     rest.sort(key=lambda c: (0 if (c.get("nicheHits") or []) else 1, -c["score"]))
     for c in rest:
         if len(top) >= want:
