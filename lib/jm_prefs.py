@@ -436,6 +436,10 @@ def cmd_recommend(params: dict) -> dict:
             info["path"] = str(child)
             info["tags"] = meta.get("tags") or []
             info["jm"] = meta.get("jm") or ""
+            # ⚠️ author 一定要带进来。我第一版漏了这行，导致作者通道
+            #    统计出来永远是空 —— top_authors=[] 候选池=0，
+            #    而报告里看不出任何异常（只是"没有同作者推荐"而已）。
+            info["author"] = meta.get("author") or ""
             info["analyzed"] = meta.get("analyzed") or ""
             info["style"] = jm_style.book_style(child, count=4)
             books.append(info)
@@ -512,6 +516,47 @@ def cmd_recommend(params: dict) -> dict:
     STYLE_TOP = int(params.get("styleTop") or 40)
     BUDGET = float(params.get("budget") or 240)
     deadline = time.time() + BUDGET
+
+    # ── 作者通道 ───────────────────────────────────────────────
+    #
+    # 🔴 为什么要单独开这条通道：
+    #    按 tag 搜出来的候选，作者是随机的 —— 你会看到一堆不同人画的「蘿莉」。
+    #    但收藏库其实暴露了更强的信号：**你反复收同一个作者**。
+    #    实测库里 16 本只有 13 个作者，其中 びよびよ 一个人占了 4 本 ——
+    #    这种"复购"比任何 tag 都准，因为它是行为，不是标签。
+    #
+    #    所以从收藏库里按次数排作者，取前几个去搜他的其他作品，单独标记来源。
+    #    配额留给它 1/5（见下面的 author_n）。
+    author_counts = {}
+    for b in books:
+        name = str(b.get("author") or "").strip()
+        if name:
+            author_counts[name] = author_counts.get(name, 0) + 1
+    # 只取收过 2 本以上的 —— 只收过 1 本的作者说明不了偏好，反而会稀释
+    top_authors = [
+        (a, n) for a, n in sorted(author_counts.items(), key=lambda kv: -kv[1]) if n >= 2
+    ][:5]
+
+    for author, _n in top_authors:
+        try:
+            page = client.search_author(author, page=1)
+        except Exception as exc:  # noqa: BLE001
+            print("[dsh-jm] 作者搜索 " + author + " 失败：" + str(exc), file=sys.stderr)
+            continue
+        for aid, info in list(page.content)[:PER_QUERY]:
+            aid = str(aid)
+            if aid in seen_ids or aid in owned or aid in cands:
+                continue
+            info = info if isinstance(info, dict) else {}
+            cands[aid] = {
+                "id": aid,
+                "title": str(info.get("name") or ""),
+                "author": str(info.get("author") or author),
+                "date": str(info.get("adddate") or ""),
+                "tags": [],
+                "hitFrom": "author:" + author,
+                "fromAuthor": author,
+            }
 
     for q in queries:
         try:
@@ -622,28 +667,59 @@ def cmd_recommend(params: dict) -> dict:
     #   加权的意义也就没了。所以这里做两段式：主流区排分，探索区专门留给小众。
     #
     #   不想看小众本？传 explore=0 关掉，退回纯排序。
+    # 三个名额池：
+    #   主力  —— 按总分排（tag 对味 + 画风像）
+    #   作者  —— 1/5，专门给你"反复收的那个作者"的其他作品
+    #   探索  —— 剩下的一部分，留给戳中小众 tag 的
+    #
+    # 🔴 为什么作者位要硬性留：作者的作品往往 tag 都差不多，
+    #    在总分排序里会被同 tag 的其他本子挤掉（分数接近，先到先得）。
+    #    给个固定名额，才能保证"你喜欢的作者"一定有露出。
     explore_ratio = params.get("explore")
     explore_ratio = 0.3 if explore_ratio is None else max(0.0, min(float(explore_ratio), 0.6))
-    explore_n = int(round(want * explore_ratio)) if want >= 4 else 0
+    author_ratio = params.get("authorQuota")
+    author_ratio = 0.2 if author_ratio is None else max(0.0, min(float(author_ratio), 0.5))
 
-    main_quota = want - explore_n
+    explore_n = int(round(want * explore_ratio)) if want >= 4 else 0
+    author_n = int(round(want * author_ratio)) if want >= 4 else 0
+    main_quota = max(1, want - explore_n - author_n)
+
     top = scored[:main_quota]
     picked = {c["id"] for c in top}
 
-    rest = [c for c in scored[main_quota:] if c["id"] not in picked]
-    # 探索位优先：小众命中多的排前面，其次是画风分高的
-    # 探索区：先保证"戳中小众"的进来，同组内按分数降序。
-    #
-    #   ⚠️ 不能按"小众命中个数"排：命中 8 个冷 tags 的杂食本会挤掉
-    #      命中 2 个但分数高得多的。用户看到的列表会是乱的（分数忽高忽低），
-    #      这比"探索位不够惊喜"更糟 —— 列表失去可读性就没人看了。
+    # ── 作者位 ──
+    # 从"作者通道来的"候选里挑，按作者出现次数降序（越常收的作者越优先），
+    # 同作者内按分数排。已下过的已经在上游排除了，这里不用再判。
+    author_pool = [
+        c for c in scored
+        if c.get("fromAuthor") and c["id"] not in picked
+    ]
+    author_pool.sort(
+        key=lambda c: (-author_counts.get(c.get("fromAuthor") or "", 0), -c["score"])
+    )
+
+    for c in author_pool:
+        if len(top) >= main_quota + author_n:
+            break
+        top.append(c)
+        picked.add(c["id"])
+        c["slot"] = "author"
+
+    # ── 探索位 ──
+    rest = [c for c in scored if c["id"] not in picked]
+    # 先保证"戳中小众"的进来，同组内按分数降序。
+    # ⚠️ 不能按"小众命中个数"排：命中 8 个冷 tags 的杂食本会挤掉
+    #    命中 2 个但分数高得多的，列表分数忽高忽低就没法看了。
     rest.sort(key=lambda c: (0 if (c.get("nicheHits") or []) else 1, -c["score"]))
     for c in rest:
         if len(top) >= want:
             break
         top.append(c)
+        picked.add(c["id"])
+        c["slot"] = "explore"
+
     for c in top:
-        c["slot"] = "explore" if c["id"] not in {x["id"] for x in scored[:main_quota]} else "main"
+        c.setdefault("slot", "main")
 
     # 报告落在**精选截图**目录，不是收藏库 ——
     # 收藏库是"素材"，推荐是"结论"。用户要的是打开精选那个文件夹就看到推荐，
@@ -669,7 +745,12 @@ def cmd_recommend(params: dict) -> dict:
         lines.append("| # | JM号 | 页数 | 总分 | 标签分 | 画风分 | 小众分 | 位 | 命中标签 | 标题 |")
         lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
         for i, c in enumerate(top, 1):
-            slot = "探索" if c.get("slot") == "explore" else "主力"
+            if c.get("slot") == "explore":
+                slot = "探索"
+            elif c.get("slot") == "author":
+                slot = "同作者"
+            else:
+                slot = "主力"
             lines.append(
                 "| " + str(i) + " | " + c["id"] + " | " + str(c["pages"]) + " | " + str(c["score"])
                 + " | " + str(c["tagScore"]) + " | " + str(c["styleScore"])
