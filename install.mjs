@@ -23,6 +23,11 @@ import { fileURLToPath } from "node:url"
 import { spawnSync } from "node:child_process"
 
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
+const ARGS = process.argv.slice(2)
+const WITH_PURGE = ARGS.includes("--with-purge")
+
+// 破甲的官方仓库。**不从本站分发**，只在用户明确要求时 clone 过来。
+const PURGE_REPO = "https://github.com/YuJunZhiXue/dsh-purge.git"
 const PLUGIN_NAME = "dsh-jm"
 const DSH_HOME = process.env.DSH_HOME || join(homedir(), ".dsh")
 const PROFILE = process.env.DSH_JM_PROFILE || "desktop"
@@ -197,7 +202,49 @@ function guessAppRoots() {
   return out
 }
 
-// ── 6. 收尾提示 ───────────────────────────────────────────────
+// ── 5.5 可选：装破甲（用户显式要求才做） ──────────────────────
+//
+// 🔴 只有传了 --with-purge 才走这里。默认什么都不做。
+//
+//    为什么不默认装：破甲会改 DSH 的 system-prompt 配置（清空 persona 前缀/后缀），
+//    这个副作用必须由用户明确同意，不能装个下载器顺手把人格配置清了。
+const PURGE_DIR = join(DSH_HOME, "plugins", "dsh-purge")
+
+if (WITH_PURGE && !existsSync(join(PURGE_DIR, "package.json"))) {
+  console.log("")
+  log("拉取破甲层（dsh-purge）…")
+  log("来源：" + PURGE_REPO)
+  log("注意：它会改 system-prompt 配置，你的 persona 前缀/后缀会被清空。")
+  try {
+    mkdirSync(dirname(PURGE_DIR), { recursive: true })
+    const r = spawnSync("git", ["clone", "--depth", "1", PURGE_REPO, PURGE_DIR], {
+      stdio: "inherit",
+      env: process.env,
+    })
+    if (r.status === 0) ok("已拉到 " + PURGE_DIR)
+    else warn("clone 失败（git 返回 " + r.status + "），破甲没装上。可不理会。")
+  } catch (e) {
+    warn("git 不可用：" + e.message)
+    log("  手动装：git clone " + PURGE_REPO)
+  }
+} else if (WITH_PURGE) {
+  ok("破甲已经在了：" + PURGE_DIR)
+}
+
+// ── 6. 破甲检测（只提示，不安装） ─────────────────────────────
+//
+// 🔴 为什么不自动装 / 不打包进来：
+//
+//    破甲层 dsh-purge 是 YuJunZhiXue 的作品（MIT）。把它打进本仓库意味着
+//    我们要替它承担分发责任 —— 而它里面带了一整套红队工具（隧道、凭证攻击、
+//    代理池…），挂在别人名下转发，作者第一个被问话。
+//
+//    所以这里只做一件事：告诉对方「有这个东西、在哪、怎么装」，
+//    装不装由他自己决定。这是最不容易出事的边界。
+const bundles = pkg.dsh.profile.bundles || []
+const hasPurge = bundles.some((b) => String(b).toLowerCase().includes("purge"))
+const purgeInstalled = existsSync(join(PROFILE_DIR, "node_modules", "dsh-purge"))
+
 console.log("")
 console.log("  ═══════════════════════════════════════════")
 console.log("   装好了。重启 DSH 生效。")
@@ -206,3 +253,33 @@ console.log("")
 console.log("   重启后发一句  jm350234  试试。")
 console.log("  ═══════════════════════════════════════════")
 console.log("")
+
+if (hasPurge || purgeInstalled) {
+  ok("检测到已装破甲层（dsh-purge），模型不会对这类请求打太极。")
+} else {
+  console.log("  ───────────────────────────────────────────")
+  console.log("  提示：你可能还需要破甲层")
+  console.log("  ───────────────────────────────────────────")
+  console.log("")
+  console.log("  这个插件只管下载，不管模型答不答应。")
+  console.log("  如果模型回你「这类内容我不能……」或者一直要你确认，")
+  console.log("  那是模型自己的对齐，不是插件坏了。")
+  console.log("")
+  console.log("  社区里有个破甲插件能解决这个，作者 YuJunZhiXue（MIT）：")
+  console.log("")
+  console.log("    https://github.com/YuJunZhiXue/dsh-purge")
+  console.log("")
+  console.log("  装它：")
+  console.log("    git clone https://github.com/YuJunZhiXue/dsh-purge.git")
+  console.log("    cd dsh-purge")
+  console.log("    node 你的dsh-jm目录/install.mjs --with-purge")
+  console.log("")
+  console.log("  或者手动改 profile（它自带 cordis.patch.yml，按它的 README 来）。")
+  console.log("")
+  console.log("  ⚠️ 装之前要知道两件事：")
+  console.log("     1. 它会改 DSH 的 system-prompt 配置 —— 清空你设的 persona 前缀/后缀")
+  console.log("     2. 它带一整套红队/渗透工具，请只在你自己机器上用")
+  console.log("")
+  console.log("  不想装也没关系：这插件本身能正常下载，只是模型可能不肯配合。")
+  console.log("")
+}
