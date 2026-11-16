@@ -12,11 +12,18 @@ last_pick.json
 个性化分析.md
 个性化推荐.md
 
-# 临时产物
-_*.py
-_*.jpg
-_*.png
-*.log
+# 调试临时文件
+# ⚠️ 只能用「下划线 + 单词」这种具体形状，不能用 _*.py ——
+#    那条规则会连 __init__.py 一起吃掉（下划线开头也是 _），
+#    结果 vendor 里 36 个包的初始化文件全没传上去，
+#    别人 clone 下来 import 直接炸。这个坑我踩过一次，代价是空白机器装不上。
+/_test*.py
+/_tmp*.py
+/_dbg*.py
+/_check*.py
+/_probe*.py
+/_sheet.jpg
+/_sheet.png
 
 # 系统
 Thumbs.db
