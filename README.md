@@ -80,7 +80,79 @@ package.json 里写了 os: [win32]。安装.bat、注册表读桌面路径、%TE
 
 ---
 
-## 装（给别人看的）
+## 装
+
+### 方式一：GitHub（推荐）
+
+```bash
+git clone https://github.com/zyt979942/dsh-jm.git
+cd dsh-jm
+```
+
+然后双击 **`安装.bat`**，或者在插件目录里跑：
+
+```bash
+node install.mjs
+```
+
+看到这一行就成功了：
+
+```
+  ✓ node_modules/dsh-jm → ...
+  ✓ 依赖已同步
+```
+
+### 方式二：下载 zip
+
+仓库页点 Code → Download ZIP，解压后双击 `安装.bat`。
+
+### ⚠️ 装完必须重启
+
+**关掉窗口不算**，托盘图标也要退掉。DSH 的插件是在启动时组装的。
+
+### 安装器到底做了什么
+
+桌面版 DSH **没有 `dsh` 命令**（那玩意只存在于 npm 全局安装的版本）。
+所以 `安装.bat` 不走 CLI，直接改 DSH 加载插件时读的配置：
+
+```
+~/.dsh/profiles/desktop/package.json
+  ├─ dependencies["dsh-jm"] = "link:<插件路径>"
+  └─ dsh.profile.bundles[] 加一项 "dsh-jm"
+~/.dsh/profiles/desktop/node_modules/dsh-jm → junction 指向插件目录
+```
+
+几个要点：
+
+- 改之前**自动备份**成 `package.json.bak`
+- 用 **junction** 不用 symlink —— Windows 下 symlink 要管理员权限，junction 不要
+- 重复跑是安全的（幂等），已装过会提示「已经有了」
+- pnpm 从 DSH 安装目录里找，找不到就跳过（不影响使用）
+
+### 手动装（万一脚本失败）
+
+编辑 `~/.dsh/profiles/desktop/package.json`，加两处：
+
+```json
+"dependencies": { "dsh-jm": "link:C:/你的路径/dsh-jm" },
+"dsh": { "profile": { "bundles": [ ..., "dsh-jm" ] } }
+```
+
+再在 `~/.dsh/profiles/desktop/node_modules/` 下建一个指向插件目录的 junction：
+
+```cmd
+mklink /J "%USERPROFILE%\.dsh\profiles\desktop\node_modules\dsh-jm" "C:\你的路径\dsh-jm"
+```
+
+### 前提
+
+- **Windows**（脚本、注册表读桌面路径、%TEMP% 缓存都是 Windows 的）
+- **DSH 桌面版自带的 Python 3.12** —— vendor 里的 .pyd 是按 3.12 编的
+- 不需要自己 `pip install` 任何东西
+
+---
+
+## 旧版安装说明（已过时，留档）
 
 ### 方式一：从插件市场装（最省事，发到 npm 之后可用）
 
