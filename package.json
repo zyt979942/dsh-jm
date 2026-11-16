@@ -1,0 +1,74 @@
+{
+  "name": "dsh-jm",
+  "version": "1.0.0",
+  "description": "发 jm 号就把漫画扒到桌面：自动解打乱、按 001 002 003 排好。自带 Python 依赖，直连可用，装完即用。",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "lib/jm.py",
+    "lib/jm_pick.py",
+    "lib/jm_prefs.py",
+    "lib/jm_style.py",
+    "vendor/**",
+    "cordis.patch.yml",
+    "安装.bat",
+    "README.md"
+  ],
+  "keywords": [
+    "deepseek",
+    "harness",
+    "dsh",
+    "dsh-plugin",
+    "comic",
+    "manga",
+    "jm",
+    "jmcomic",
+    "download"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "os": [
+    "win32"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/USERNAME/dsh-jm.git"
+  },
+  "homepage": "https://github.com/USERNAME/dsh-jm#readme",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
+    },
+    "market": {
+      "title": {
+        "zh": "JM 漫画下载",
+        "en": "JM Comic Download"
+      },
+      "category": "usage",
+      "summary": {
+        "zh": "在聊天里发 jm350234，那本漫画自动下载到桌面，按 001 002 003 排好。多话自动合并，图片自动解打乱。自带 Python 依赖，不需要自己装环境，国内可直连。",
+        "en": "Send jm350234 in chat and the comic lands on your Desktop numbered 001.jpg, 002.jpg … Multi-chapter albums are merged; scrambled pages are auto-restored. Bundles its own Python deps — no setup required."
+      },
+      "labels": [
+        "漫画",
+        "下载",
+        "一键安装"
+      ]
+    }
+  }
+}

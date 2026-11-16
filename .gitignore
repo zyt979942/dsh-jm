@@ -1,0 +1,28 @@
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 本机状态（不该进仓库）
+.dsh-jm-index.json
+prefs.json
+last.json
+last_pick.json
+标签.txt
+个性化分析.md
+个性化推荐.md
+
+# 临时产物
+_*.py
+_*.jpg
+_*.png
+*.log
+
+# 系统
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# 编辑器
+.vscode/
+.idea/

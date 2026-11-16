@@ -1,0 +1,9 @@
+# dsh-jm —— 打 jm 号，漫画直接躺到桌面
+#
+# 装上之后 profile 只要在 dsh.profile.bundles 里列上 dsh-jm 就生效。
+# 本插件零 @deepseek-ai/* 依赖（桌面版 autoInstallPeers: false，
+# 裸 import dsh-tools 会让整条插件不激活），工具用的 defineTool 是自己写的等价实现。
+- insert:
+    - id: dsh-jm
+      name: dsh-jm
+      config: {}

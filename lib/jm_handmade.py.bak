@@ -1,0 +1,583 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+dsh-jm 驱动 —— 抓禁漫的漫画，存成 `001.jpg 002.jpg ...` 的文件夹。
+
+为什么是 Python：① 宿主自带的那份 Python 已经有 requests / Pillow / lxml；
+② 打乱还原要读像素，Node 里做要额外装依赖。跟 kards 驱动同一个套路：
+参数走 stdin、结果走 stdout、一次调用一个进程（没有常驻状态）。
+
+三条硬知识（都是本机实测出来的，别随手改）：
+
+1. **镜像 + 代理**。18comic.vip / .org 直连是 000，必须走本机代理；
+   18comic.ink 是可用的那个。所以这里先读注册表拿 ProxyServer，再逐个试镜像。
+
+2. **图是拆成横条打乱的**。页面里 `scramble_id` 和 `aid` 决定要不要还原：
+   `aid < scramble_id` → 原图直接用；否则按 `get_num(aid, 页码)` 算段数，
+   再把条带倒序拼回去（等价复刻 jquery.photo-0.4.js 里的 drawImage 循环，
+   那份代码被 eval + 字符串数组混淆过，我是把它还原成明文对着搬的）。
+
+3. **图链在 HTML 里，不用跑浏览器**。`data-original="https://cdn-*/media/photos/..."`，
+   一页 HTML 就带全（长条图一次全给，分页只影响懒加载）。
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from io import BytesIO
+from pathlib import Path
+
+import requests
+from PIL import Image
+
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+# 按"本机实测可用性"排序；第一个能出 200 的就用它
+MIRRORS = [
+    "18comic.ink",
+    "18comic.vip",
+    "jmcomic.me",
+    "18comic-c.xyz",
+    "jmcomic1.me",
+    "18comic.org",
+]
+
+CDN_RE = re.compile(
+    r'data-original="(https?://[^"]+?/media/photos/\d+/\d+\.(?:webp|jpg|jpeg|png))"', re.I
+)
+CDN_RE_REL = re.compile(r'data-original="(/media/photos/\d+/\d+\.(?:webp|jpg|jpeg|png))"', re.I)
+TITLE_RE = re.compile(r"<title>(.*?)</title>", re.S | re.I)
+
+
+# ────────────────────────────── 基础工具 ──────────────────────────────
+def desktop_dir() -> Path:
+    """真实桌面路径。注册表里那份是 %USERPROFILE% 展开后的，比硬拼 ~/Desktop 稳。"""
+    try:
+        import winreg
+
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+        )
+        value, _ = winreg.QueryValueEx(key, "Desktop")
+        return Path(os.path.expandvars(value))
+    except Exception:
+        return Path(os.path.expanduser("~")) / "Desktop"
+
+
+def registry_proxy() -> str | None:
+    """找本机可用的代理。
+
+    这里的逻辑是**实测逼出来的**（2026-11-07 用户把梯子"关了"，插件全超时）：
+      · 用户说的"关梯子"，常常只是关掉 Windows 的**系统代理开关**
+        （ProxyEnable=0），而 Clash / Verge 的进程还在跑、7897 还在监听。
+      · 真要是不翻墙 —— 18comic.ink / jmcomic.me 直连是 TLS 握手就被 reset，
+        不是 403 也不是超时，是压根连不上。所以直连这条路不存在。
+    所以：先看系统代理开关，开着就用；关着但端口还活着，也照样用。
+    """
+    import socket
+
+    candidates: list[str] = []
+
+    # ① 环境变量（用户在别处设过就尊重它）
+    for key in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        value = os.environ.get(key)
+        if value and "://" in value:
+            candidates.append(value)
+
+    # ② 注册表：ProxyServer 记着地址，ProxyEnable 只决定系统要不要用
+    registry_server = None
+    try:
+        import winreg
+
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        )
+        server, _ = winreg.QueryValueEx(key, "ProxyServer")
+        if server:
+            server = str(server)
+            if "=" in server:
+                parts = dict(p.split("=", 1) for p in server.split(";") if "=" in p)
+                server = parts.get("https") or parts.get("http") or ""
+            if server:
+                registry_server = server
+                try:
+                    enabled, _ = winreg.QueryValueEx(key, "ProxyEnable")
+                except Exception:
+                    enabled = 0
+                if enabled:
+                    candidates.insert(0, f"http://{server}")
+                else:
+                    # 开关关了但地址还在 —— 进程有没有活，下面统一探
+                    candidates.append(f"http://{server}")
+    except Exception:
+        pass
+
+    # ③ 常见客户端端口兜底（用户手动关了系统代理，但客户端还在跑）
+    for port in (7897, 7890, 7891, 10809, 10808, 1080, 2080):
+        candidates.append(f"http://127.0.0.1:{port}")
+
+    # 去重 + 逐个探活（能建立 TCP 就算活着 —— 真的能不能翻出去由请求自己判断）
+    seen, ordered = set(), []
+    for item in candidates:
+        if item not in seen:
+            seen.add(item)
+            ordered.append(item)
+
+    for url in ordered:
+        try:
+            parsed = url.split("://", 1)[1].rstrip("/")
+            host, _, port_text = parsed.partition(":")
+            port = int(port_text or 80)
+        except Exception:
+            continue
+        try:
+            with socket.create_connection((host, port), timeout=0.6):
+                return url
+        except Exception:
+            continue
+
+    return None
+
+
+def safe_name(name: str, limit: int = 80) -> str:
+    name = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", (name or "").strip())
+    name = re.sub(r"\s+", " ", name).strip(" .")
+    return (name[:limit] or "untitled").strip()
+
+
+def new_session(proxy: str | None):
+    s = requests.Session()
+    s.headers.update(
+        {
+            "User-Agent": UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        }
+    )
+    if proxy:
+        s.proxies.update({"http": proxy, "https": proxy})
+    s.verify = False  # 镜像站证书经常过期；这不影响内容
+    return s
+
+
+def get_html(session, url: str, referer: str = "", timeout: int = 25) -> str:
+    """请求一个页面并**强制按 utf-8 解码**。
+
+    坑：镜像站的 Content-Type 有时不带 charset，requests 会退回 ISO-8859-1，
+    中文标题就会变成 `[����]`。所以这里统一自己解。
+    """
+    headers = {"Referer": referer} if referer else {}
+    r = session.get(url, timeout=timeout, headers=headers)
+    r.raise_for_status()
+    if not r.encoding or r.encoding.lower() in ("iso-8859-1", "ascii"):
+        r.encoding = "utf-8"
+    try:
+        return r.content.decode("utf-8")
+    except UnicodeDecodeError:
+        return r.content.decode("gb18030", errors="replace")
+
+
+def pick_mirror(session, prefer: str | None, timeout: int = 10) -> str:
+    hosts = ([prefer] if prefer else []) + [h for h in MIRRORS if h != prefer]
+    errors = []
+    for host in hosts:
+        if not host:
+            continue
+        try:
+            r = session.get(f"https://{host}/", timeout=timeout)
+            if r.status_code == 200 and len(r.text) > 5000:
+                return host
+            errors.append(f"{host}:HTTP{r.status_code}")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{host}:{type(exc).__name__}")
+    raise RuntimeError("所有镜像都不通（" + ", ".join(errors) + "）—— 检查代理是否开着")
+
+
+# ────────────────────────────── 解析 ──────────────────────────────
+def parse_title(html: str) -> str:
+    m = TITLE_RE.search(html)
+    if not m:
+        return ""
+    title = re.sub(r"<[^>]+>", "", m.group(1)).strip()
+    title = re.sub(r"\s*Comics?\s*-\s*禁漫天堂\s*$", "", title, flags=re.I)
+    title = re.sub(r"\s*-\s*禁漫天堂\s*$", "", title)
+    title = re.sub(r"\s*\|\s*H\S*$", "", title)   # 尾部 "|H動漫"
+    title = re.sub(r"\s*\|\s*$", "", title)
+    return title.strip()
+
+
+def parse_photo(html: str, host: str) -> dict:
+    aid = 0
+    m = re.search(r"\bvar\s+aid\s*=\s*(\d+)", html)
+    if m:
+        aid = int(m.group(1))
+    if not aid:
+        m = re.search(r'id="album_id"[^>]*value="(\d+)"', html)
+        if m:
+            aid = int(m.group(1))
+    if not aid:
+        m = re.search(r"/media/photos/(\d+)/", html)
+        if m:
+            aid = int(m.group(1))
+
+    scramble = 0
+    m = re.search(r"\bscramble_id\s*=\s*(\d+)", html)
+    if m:
+        scramble = int(m.group(1))
+
+    total = 0
+    m = re.search(r"totalPhotos\s*:\s*(\d+)", html) or re.search(
+        r"\bvar\s+total\s*=\s*(\d+)", html
+    )
+    if m:
+        total = int(m.group(1))
+
+    urls = CDN_RE.findall(html)
+    if not urls:
+        urls = [f"https://{host}{u}" for u in CDN_RE_REL.findall(html)]
+
+    # 去重保序（页面里同一张图可能在缩略图区和正文区各出现一次）
+    seen, ordered = set(), []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            ordered.append(u)
+
+    return {
+        "aid": aid,
+        "scramble_id": scramble,
+        "total": total or len(ordered),
+        "title": parse_title(html),
+        "images": ordered,
+    }
+
+
+def parse_album(html: str, host: str) -> dict:
+    """作品页：拿标题 + 这一本的 photo id + 系列里的其他话。
+
+    章节只在 `id="episode-block"` 那个 div 里找 —— 页面别处（推荐位、排行榜、
+    上一篇/下一篇）也全是 /photo/ 链接，全页扫会把别的书当成这一本的分话。
+    """
+    block = ""
+    i = html.find('id="episode-block"')
+    if i > 0:
+        end = html.find('id="download-block"', i)
+        block = html[i : end if end > i else i + 60000]
+
+    chapters = []
+    for m in re.finditer(
+        r'href="(?:https?://[^/"]+)?/photo/(\d+)"[^>]*?>(.*?)</(?:a|li)>',
+        block,
+        re.S,
+    ):
+        cid = int(m.group(1))
+        name = re.sub(r"<[^>]+>", " ", m.group(2) or "")
+        name = re.sub(r"\s+", " ", name).strip()
+        if cid not in {c["id"] for c in chapters}:
+            chapters.append({"id": cid, "name": name[:120] or f"第{len(chapters) + 1}話"})
+
+    photos = list(dict.fromkeys(re.findall(r'href="(?:https?://[^/"]+)?/photo/(\d+)', html)))
+    return {
+        "title": parse_title(html),
+        "photos": photos,
+        "chapters": chapters[:200],
+    }
+
+
+# ────────────────────────────── 打乱还原 ──────────────────────────────
+def _strip_count(aid: int, page: str) -> int:
+    """复刻 jquery.photo-0.4.js 里的 get_num()。"""
+    last = hashlib.md5(f"{aid}{page}".encode()).hexdigest()[-1]
+    n = ord(last)
+    if 268850 <= aid <= 421925:
+        n %= 10
+    elif aid >= 421926:
+        n %= 8
+    return {0: 2, 1: 4, 2: 6, 3: 8, 4: 10, 5: 12, 6: 14, 7: 16, 8: 18, 9: 20}.get(n, 10)
+
+
+def unscramble(data: bytes, aid: int, page: str) -> bytes:
+    """
+    把横条倒序拼回去。等价于 JS 里那段：
+
+        g = floor(h / s); c = g*m; w = h - g*(m+1) - r;
+        m == 0 ? g += r : c += r;
+        drawImage(img, 0, w, width, g, 0, c, width, g)
+    """
+    img = Image.open(BytesIO(data))
+    img.load()
+    w, h = img.size
+    segs = _strip_count(aid, page)
+    if segs <= 1 or h < segs * 2:
+        out = BytesIO()
+        img.save(out, "PNG" if img.mode in ("RGBA", "LA") else "JPEG", quality=95)
+        return out.getvalue()
+
+    g0 = h // segs
+    r = h % segs
+    canvas = img.copy()
+    for m in range(segs):
+        gh = g0
+        dy = g0 * m
+        sy = h - g0 * (m + 1) - r
+        if m == 0:
+            gh += r
+        else:
+            dy += r
+        if gh <= 0:
+            continue
+        canvas.paste(img.crop((0, sy, w, sy + gh)), (0, dy))
+
+    out = BytesIO()
+    canvas.save(out, "PNG" if canvas.mode in ("RGBA", "LA") else "JPEG", quality=95)
+    return out.getvalue()
+
+
+# ────────────────────────────── 命令 ──────────────────────────────
+def cmd_search(params: dict) -> dict:
+    keyword = str(params.get("keyword") or "").strip()
+    if not keyword:
+        raise RuntimeError("keyword 不能为空")
+    num = max(1, min(int(params.get("num") or 10), 50))
+
+    session = new_session(params.get("proxy") or registry_proxy())
+    host = pick_mirror(session, params.get("mirror"))
+    url = f"https://{host}/search/photos?search_query={requests.utils.quote(keyword)}&page=1"
+    r = session.get(url, timeout=25, headers={"Referer": f"https://{host}/"})
+    r.raise_for_status()
+    html = r.text
+
+    items, seen = [], set()
+    for m in re.finditer(r'href="(?:https?://[^/"]+)?/album/(\d+)(?:/([^"]*))?"', html):
+        album_id = m.group(1)
+        if album_id in seen:
+            continue
+        window_start = max(0, m.start() - 2000)
+        window = html[window_start : m.start() + 2000]
+        title = ""
+        tm = re.search(r'<div class="video-title"[^>]*>(.*?)</div>', window, re.S)
+        if tm:
+            title = re.sub(r"<[^>]+>", "", tm.group(1)).strip()
+        if not title:
+            tm = re.search(r'title="([^"]{2,120})"', window)
+            if tm:
+                title = tm.group(1).strip()
+        if not title:
+            title = requests.utils.unquote(m.group(2) or "").strip()
+        if not title:
+            continue
+        seen.add(album_id)
+        items.append({"id": int(album_id), "title": title})
+        if len(items) >= num:
+            break
+
+    return {"ok": True, "mirror": host, "keyword": keyword, "count": len(items), "items": items}
+
+
+def cmd_info(params: dict) -> dict:
+    target = str(params.get("id") or "").strip()
+    if not target.isdigit():
+        raise RuntimeError("id 必须是纯数字（jm 后面的那串）")
+
+    session = new_session(params.get("proxy") or registry_proxy())
+    host = pick_mirror(session, params.get("mirror"))
+
+    r = session.get(f"https://{host}/album/{target}", timeout=25, headers={"Referer": f"https://{host}/"})
+    if r.status_code != 200:
+        raise RuntimeError(f"作品页打不开（HTTP {r.status_code}）")
+    album = parse_album(r.text, host)
+
+    # 作品页只是封面；真正的图在 /photo/<id>
+    photo_id = target
+    result = {
+        "ok": True,
+        "mirror": host,
+        "id": int(photo_id),
+        "title": album["title"],
+        "chapters": album["chapters"],
+    }
+
+    pr = session.get(
+        f"https://{host}/photo/{photo_id}", timeout=25, headers={"Referer": f"https://{host}/album/{target}"}
+    )
+    if pr.status_code == 200:
+        info = parse_photo(pr.text, host)
+        result.update(
+            {
+                "title": info["title"] or result["title"],
+                "pages": info["total"],
+                "descramble": info["aid"] >= info["scramble_id"] > 0,
+            }
+        )
+    return result
+
+
+def cmd_download(params: dict) -> dict:
+    target = str(params.get("id") or "").strip()
+    if not target.isdigit():
+        raise RuntimeError("id 必须是纯数字（jm 后面的那串）")
+
+    out_root = Path(params.get("dest") or desktop_dir())
+    fmt = str(params.get("format") or "jpg").lower()  # jpg | keep
+    threads = max(1, min(int(params.get("threads") or 8), 16))
+    limit = int(params.get("limit") or 0)
+    start = max(1, int(params.get("start") or 1))
+    end = int(params.get("end") or 0)
+
+    proxy = params.get("proxy") or registry_proxy()
+    session = new_session(proxy)
+    host = pick_mirror(session, params.get("mirror"))
+
+    # ⚠️ 镜像之间不同步：有的站把某个 id 整段下架了，会 301 到 /error/album_missing。
+    #    这种情况要换镜像再试，而不是直接告诉用户"这本不存在"。
+    page_url = f"https://{host}/photo/{target}"
+    info = None
+    tried = [host]
+    for candidate in [host] + [h for h in MIRRORS if h != host]:
+        if candidate != host:
+            tried.append(candidate)
+        try:
+            url = f"https://{candidate}/photo/{target}"
+            resp = session.get(url, timeout=30, headers={"Referer": f"https://{candidate}/album/{target}"})
+            if "album_missing" in resp.url or "album_missing" in resp.text[:4000]:
+                continue
+            if resp.status_code != 200:
+                continue
+            text = resp.content.decode("utf-8", errors="replace")
+            parsed = parse_photo(text, candidate)
+            if parsed["images"]:
+                info, host, page_url = parsed, candidate, url
+                break
+        except Exception:  # noqa: BLE001
+            continue
+
+    if info is None:
+        raise RuntimeError(
+            f"JM {target} 在能连的镜像上都没有：{', '.join(tried)} 全部返回 album_missing。"
+            "这本大概率已被下架或删除，换个 id 吧"
+        )
+
+    title = safe_name(info["title"] or f"JM{target}")
+    folder = out_root / title
+    folder.mkdir(parents=True, exist_ok=True)
+
+    urls = info["images"]
+    total = len(urls)
+    if end:
+        urls = urls[start - 1 : end]
+    elif start > 1:
+        urls = urls[start - 1 :]
+    if limit:
+        urls = urls[:limit]
+
+    aid, scramble = info["aid"], info["scramble_id"]
+    need_fix = scramble > 0 and aid >= scramble
+    width = 3 if total < 1000 else 4
+
+    lock = threading.Lock()
+    done = [0]
+    failures: list[str] = []
+
+    def fetch(index: int, url: str) -> tuple[int, bool]:
+        page = f"{index:05d}"
+        for attempt in range(3):
+            try:
+                resp = session.get(url, timeout=40, headers={"Referer": page_url})
+                if resp.status_code != 200:
+                    raise RuntimeError(f"HTTP {resp.status_code}")
+                body = resp.content
+                if len(body) < 1024:
+                    raise RuntimeError("内容太小")
+                if need_fix:
+                    body = unscramble(body, aid, page)
+                elif fmt == "jpg":
+                    img = Image.open(BytesIO(body))
+                    img.load()
+                    buf = BytesIO()
+                    img.convert("RGB").save(buf, "JPEG", quality=95)
+                    body = buf.getvalue()
+                suffix = ".jpg" if fmt == "jpg" else Path(url).suffix or ".jpg"
+                (folder / f"{index:0{width}d}{suffix}").write_bytes(body)
+                with lock:
+                    done[0] += 1
+                return index, True
+            except Exception:  # noqa: BLE001
+                if attempt == 2:
+                    with lock:
+                        failures.append(f"{index:0{width}d} {url}")
+                    return index, False
+                time.sleep(0.8 * (attempt + 1))
+        return index, False
+
+    started = time.time()
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        futures = [pool.submit(fetch, i, u) for i, u in enumerate(urls, start=start)]
+        for _ in as_completed(futures):
+            pass
+
+    files = sorted(p.name for p in folder.iterdir() if p.is_file())
+    return {
+        "ok": not failures,
+        "id": int(target),
+        "title": info["title"],
+        "folder": str(folder),
+        "pages": total,
+        "saved": len(files),
+        "descrambled": need_fix,
+        "format": fmt,
+        "seconds": round(time.time() - started, 1),
+        "failed": failures[:20],
+        "first": files[0] if files else None,
+        "last": files[-1] if files else None,
+    }
+
+
+COMMANDS = {"search": cmd_search, "info": cmd_info, "download": cmd_download}
+
+
+def main() -> int:
+    # Windows 的 stdout 默认 cp936 —— 中文标题会被写成 cp936 字节，Node 端 UTF-8 解码直接崩。
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("command", choices=sorted(COMMANDS))
+    parser.add_argument("--params", default="-")
+    args = parser.parse_args()
+
+    raw = sys.stdin.read() if args.params == "-" else args.params
+    try:
+        params = json.loads(raw or "{}")
+    except json.JSONDecodeError as exc:
+        print(json.dumps({"ok": False, "error": f"参数不是 JSON：{exc}"}, ensure_ascii=False))
+        return 1
+
+    try:
+        result = COMMANDS[args.command](params)
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False))
+        return 1
+
+
+if __name__ == "__main__":
+    import urllib3
+
+    urllib3.disable_warnings()
+    sys.exit(main())
