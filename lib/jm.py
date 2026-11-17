@@ -769,7 +769,19 @@ def _mark_hinted() -> None:
 
 
 def _remember_download(album_id: str, title: str) -> None:
-    """下完记一笔。记不住也不影响下载本身，所以失败只 warn 不抛。"""
+    """
+    下完记两笔：
+      ① last.json —— "最近下的是哪本"（给 jm_author 省略 id 用）
+      ② prefs.seen —— 已下载清单（设置页那个大文本框，推荐时去重用）
+
+    🔴 第 ② 笔一开始漏了。
+       结果设置页里那个框永远只有用户手填的那几个号，
+       用户看到的印象就是"这插件不会自动记" —— 而实际下载记录在索引里躺着。
+       两处数据不同步，最坑的是用户手动删了某一本之后，
+       推荐还会推它（因为 seen 里没有）。
+
+    ⚠️ 延迟导入 jm_prefs：它 import jm，写在一起会循环。
+    """
     try:
         _state_path().write_text(
             json.dumps(
@@ -784,6 +796,26 @@ def _remember_download(album_id: str, title: str) -> None:
         )
     except Exception as exc:  # noqa: BLE001
         print(f"[dsh-jm] 记最近下载失败：{exc}", file=sys.stderr)
+
+    # ② 同步到 seen 清单
+    try:
+        _sync_seen(album_id)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[dsh-jm] 同步已下载清单失败：{exc}", file=sys.stderr)
+
+
+def _sync_seen(album_id: str) -> None:
+    """把 jm 号追加进 prefs.seen，已有就跳过。"""
+    import jm_prefs
+
+    prefs = jm_prefs.load_prefs()
+    current = jm_prefs.parse_seen(prefs.get("seen") or "")
+    aid = str(album_id).strip()
+    if not aid or aid in current:
+        return
+    current.add(aid)
+    # 保持"一行一个"的可读格式，排序后写回
+    jm_prefs.save_prefs({"seen": "\n".join(sorted(current))})
 
 
 def _last_download() -> dict:
