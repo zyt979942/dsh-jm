@@ -564,6 +564,12 @@ def cmd_pick_download(params):
             if hit is not None:
                 folder, have, want = hit
                 if want and have >= want:
+                    # 跳过也要补记。用户可能换过机器、或 prefs 被清过，
+                    # 目录里有文件但 seen 里没有 —— 那推荐还会推这本。
+                    try:
+                        jm._sync_seen(tid)
+                    except Exception:  # noqa: BLE001
+                        pass
                     skipped.append({
                         "id": int(tid),
                         "title": folder.name,
