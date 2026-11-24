@@ -435,7 +435,7 @@ def cmd_recommend(params: dict) -> dict:
             info = _scan_book(child)
             info["path"] = str(child)
             info["tags"] = meta.get("tags") or []
-            info["jm"] = meta.get("jm") or ""
+            info["jm"] = meta.get("jm") or ""  # noqa: E501
             # ⚠️ author 一定要带进来。我第一版漏了这行，导致作者通道
             #    统计出来永远是空 —— top_authors=[] 候选池=0，
             #    而报告里看不出任何异常（只是"没有同作者推荐"而已）。
@@ -860,6 +860,35 @@ def cmd_prefs(params: dict) -> dict:
     }
 
 
+def _collect_books(root: Path) -> list:
+    """
+    把一个库目录展开成"一本一条"的列表。**支持两层**。
+
+    🔴 为什么要两层：
+       按作者批量下载时，落盘是 桌面/<作者名>/<本子名>/。
+       一开始只扫第一层，结果 <作者名>/ 里没有图（图在子目录里），
+       整整 30 本被当成 0 本 —— 画像少了一大块，推荐还会把它们又推一遍。
+
+    规则：
+      · 目录里有图  → 这一层就是一本
+      · 目录里没图、但子目录有图 → 每个子目录是一本（作者文件夹）
+      · 只有一层的普通结构完全不受影响
+    """
+    out = []
+    for child in sorted(root.iterdir()):
+        if not child.is_dir():
+            continue
+        info = _scan_book(child)
+        if info:
+            out.append(child)
+            continue
+        # 没有图：看看是不是作者文件夹
+        for sub in sorted(child.iterdir()):
+            if sub.is_dir() and _scan_book(sub):
+                out.append(sub)
+    return out
+
+
 def _scan_book(folder: Path) -> dict:
     """数一本：页数、总大小、主流尺寸、格式。"""
     files = [f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in IMG_SUFFIX]
@@ -1054,13 +1083,17 @@ def cmd_analyze(params: dict) -> dict:
 
     books = []
     loose = [f for f in root.iterdir() if f.is_file() and f.suffix.lower() in IMG_SUFFIX]
-    for child in sorted(root.iterdir()):
-        if child.is_dir():
-            info = _scan_book(child)
-            if info:
-                info["path"] = str(child)
-                info["tags"] = read_tags_txt(child).get("tags") or []
-                books.append(info)
+    for folder in _collect_books(root):
+        info = _scan_book(folder)
+        if not info:
+            continue
+        meta = read_tags_txt(folder)
+        info["path"] = str(folder)
+        info["tags"] = meta.get("tags") or []
+        info["jm"] = meta.get("jm") or ""
+        info["author"] = meta.get("author") or ""
+        info["analyzed"] = meta.get("analyzed") or ""
+        books.append(info)
 
     total_pages = sum(b["pages"] for b in books)
     total_mb = round(sum(b["mb"] for b in books), 1)
