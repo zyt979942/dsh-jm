@@ -377,6 +377,24 @@ def _weighted_tags(tag_rank, books_total=1):
     return out
 
 
+# 语言类 tag：不反映内容偏好，只是"这本书有没有中文"。
+#
+# 🔴 为什么必须从推荐里剔除：
+#    「中文」在库里 24/60 本，权重最高，结果推荐永远优先推汉化本。
+#    但用户要的不是"有中文的"，而是"内容对味的" ——
+#    很多好本子没汉化，剔除后它们才有机会进来。
+#
+# ⚠️ 只从**推荐打分**里剔除，不影响分析报告里的标签统计（那份还是如实展示）。
+LANG_TAGS = {
+    "中文", "漢化", "汉化", "中國翻譯", "中文翻譯", "chinese", "translated",
+    "中國語", "中文版", "繁體", "简体", "简中", "繁中",
+}
+
+
+def _is_lang_tag(tag: str) -> bool:
+    return str(tag or "").strip().lower() in {x.lower() for x in LANG_TAGS}
+
+
 def _is_niche(count, books_total):
     """
     小众 = 在库里只出现过一次、且总量不到一成的 tag。
@@ -444,7 +462,9 @@ def cmd_recommend(params: dict) -> dict:
             info["style"] = jm_style.book_style(child, count=4)
             books.append(info)
 
-    tag_rank = _tag_ranking(books)
+    tag_rank_all = _tag_ranking(books)
+    # 推荐用的榜单把语言类剔掉；报告里仍用全量（如实展示）
+    tag_rank = [t for t in tag_rank_all if not _is_lang_tag(t["tag"])]
     weights = _weighted_tags(tag_rank, len(books))
     weight_total = sum(weights.values()) or 1.0
     niche_counts = {
@@ -625,7 +645,9 @@ def cmd_recommend(params: dict) -> dict:
 
     scored = []
     for aid, c in cands.items():
-        tags_low = [t.lower() for t in c["tags"]]
+        # 语言类 tag 不参与打分（seen 的权重表里本来就没有它们，
+        # 但候选身上带着，留着会让"命中标签"的展示很啰嗦）
+        tags_low = [t.lower() for t in c["tags"] if not _is_lang_tag(t)]
         # 归一化：除以全部 tag 权重之和。
         # ⚠️ 不归一化的话 IDF 会把分数抬到 0.8+，那 0.6 的权重就名不副实了。
         raw_tag = sum(weights.get(t, 0) for t in tags_low)
